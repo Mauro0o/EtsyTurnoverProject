@@ -1,0 +1,13 @@
+# Etsy Turnover Scraper – Python dependencies
+# Install with: pip install -r requirements.txt
+# After install, run: playwright install chromium
+
+# Browser automation
+playwright>=1.42.0
+
+# HTML parsing
+beautifulsoup4>=4.12.3
+lxml>=5.1.0
+
+# Excel export
+openpyxl>=3.1.2
