@@ -5,7 +5,7 @@ Responsibilities:
   - Launch/close Playwright browser context
   - Navigate pages with retries and exponential backoff
   - Apply anti-detection: custom UA, hide webdriver flag, configurable viewport
-  - Dismiss cookie/privacy banners (GDPR consent overlays on Etsy)
+  - Handle cookie/privacy banners by clicking "Essential Cookies Only" ONLY
   - Inject randomised delays to pace requests
   - Optionally save HTML snapshots for offline debugging
   - Clean shutdown of all browser resources
@@ -16,6 +16,12 @@ Anti-detection notes:
   - Visible browser mode is the default (headless=False) to reduce fingerprint risk
   - User-agent can be rotated from a small pool
   - No aggressive techniques (proxy rotation, CAPTCHA solving) are used
+
+Cookie handling policy:
+  - Only clicks "Essential Cookies Only" — never "Accept", "Accept All", etc.
+  - UPDATE _ESSENTIAL_COOKIE_TIMEOUT_MS if Etsy's consent dialog loads slowly.
+  - UPDATE the candidate locators in _handle_cookie_banner() if Etsy renames the
+    button (search the page source for the new button text or role).
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -40,20 +47,15 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Cookie / GDPR banner selectors – tried in order.
-# UPDATE this list if Etsy changes its consent overlay selectors.
+# Cookie banner – "Essential Cookies Only" handling
 # ---------------------------------------------------------------------------
-COOKIE_DISMISS_SELECTORS: list[str] = [
-    "button[data-gdpr-single-choice-accept]",
-    "button#onetrust-accept-btn-handler",
-    "button.gdpr-overlay-header__save-settings",
-    "[data-selector='gdpr-single-choice-overlay'] button",
-    "button:has-text('Accept')",
-    "button:has-text('I Accept')",
-    "button:has-text('Accept all')",
-    "button:has-text('Accept All')",
-    "button:has-text('Accept cookies')",
-]
+# How long to wait for each candidate element to appear (ms).
+# Increase if Etsy's consent overlay loads slowly after DOM-ready.
+# UPDATE the timeout or candidate locators below if Etsy changes its dialog.
+_ESSENTIAL_COOKIE_TIMEOUT_MS: int = 2_500
+
+# How long to pause after a successful click so the overlay can animate out.
+_ESSENTIAL_COOKIE_DISMISS_WAIT: float = 1.0
 
 
 class BrowserManager:
@@ -188,7 +190,7 @@ class BrowserManager:
                     timeout=timing_cfg.page_load_timeout_ms,
                 )
                 await self._wait_after_nav()
-                await self._dismiss_cookie_banner()
+                await self._handle_cookie_banner()
                 html = await self._page.content()
                 logger.debug("Received %d bytes from %s", len(html), url)
                 return html
@@ -245,24 +247,60 @@ class BrowserManager:
         logger.debug("Inter-page delay: %.2fs", delay)
         await asyncio.sleep(delay)
 
-    async def _dismiss_cookie_banner(self) -> None:
+    async def _handle_cookie_banner(self) -> bool:
         """
-        Attempt to dismiss GDPR/cookie consent banners.
+        Click "Essential Cookies Only" on Etsy's consent overlay.
 
-        Tries each selector in COOKIE_DISMISS_SELECTORS and clicks the first
-        match found.  Silently continues if no banner is present.
+        Policy: only clicks the exact "Essential Cookies Only" button.
+        Never clicks "Accept", "Accept All", or any other consent option.
+
+        Tries three candidate locators in order, each with a short timeout so
+        the method is fast when no banner is present.  Retries once if the
+        first pass finds nothing (banner may appear slightly after DOM-ready).
+
+        Returns True if the button was clicked, False if no banner was found
+        or the click could not be completed.
+
+        UPDATE candidate locators here if Etsy renames the button.
         """
         assert self._page is not None
-        for selector in COOKIE_DISMISS_SELECTORS:
-            try:
-                btn = await self._page.query_selector(selector)
-                if btn:
-                    await btn.click()
-                    logger.debug("Dismissed cookie banner via: %s", selector)
-                    await asyncio.sleep(0.8)
-                    return
-            except Exception:
-                pass  # Banner absent or already dismissed
+
+        async def _try_click() -> bool:
+            candidates = [
+                self._page.get_by_role("button", name=re.compile(r"Essential Cookies Only", re.I)),
+                self._page.locator("button:has-text('Essential Cookies Only')"),
+                self._page.locator("text=Essential Cookies Only"),
+            ]
+            for locator in candidates:
+                try:
+                    logger.debug("Cookie banner: trying locator %s", locator)
+                    # wait_for with a short timeout — returns immediately if absent.
+                    await locator.first.wait_for(
+                        state="visible", timeout=_ESSENTIAL_COOKIE_TIMEOUT_MS
+                    )
+                    count = await locator.count()
+                    if count == 0:
+                        continue
+                    await locator.first.click()
+                    logger.info("Cookie banner: clicked 'Essential Cookies Only'.")
+                    await asyncio.sleep(_ESSENTIAL_COOKIE_DISMISS_WAIT)
+                    return True
+                except Exception as exc:
+                    logger.debug("Cookie banner: candidate not found/clickable — %s", exc)
+            return False
+
+        # First attempt.
+        if await _try_click():
+            return True
+
+        # Single retry: banner sometimes appears a moment after DOM-ready.
+        logger.debug("Cookie banner: first pass found nothing, retrying once.")
+        await asyncio.sleep(1.0)
+        if await _try_click():
+            return True
+
+        logger.debug("Cookie banner: no 'Essential Cookies Only' button found — continuing.")
+        return False
 
     def _select_user_agent(self) -> str:
         """Return a UA string, rotating from the pool if enabled."""
