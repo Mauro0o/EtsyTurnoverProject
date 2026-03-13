@@ -136,20 +136,27 @@ class BrowserManager:
 
     async def stop(self) -> None:
         """Cleanly close all browser resources.  Swallows errors during shutdown."""
-        for resource, label in [
-            (self._context, "context"),
-            (self._browser, "browser"),
-            (self._playwright, "playwright"),
+        # Close in dependency order: page → context → browser → playwright.
+        # Playwright uses .stop(), not .close() — calling .close() raises AttributeError.
+        for resource, label, use_stop in [
+            (self._page, "page", False),
+            (self._context, "context", False),
+            (self._browser, "browser", False),
+            (self._playwright, "playwright", True),
         ]:
-            if resource:
-                try:
+            if resource is None:
+                continue
+            try:
+                if use_stop:
+                    await resource.stop()
+                else:
                     await resource.close()
-                except Exception as exc:
-                    logger.warning("Error closing %s: %s", label, exc)
+            except Exception as exc:
+                logger.debug("Error closing %s: %s", label, exc)
+        self._page = None
         self._context = None
         self._browser = None
         self._playwright = None
-        self._page = None
 
     # ------------------------------------------------------------------
     # Navigation
@@ -212,22 +219,29 @@ class BrowserManager:
     async def _wait_after_nav(self) -> None:
         """Randomised pause after a navigation to simulate reading time."""
         t = self.config.timing
-        lo, hi = t.min_delay_after_nav, t.max_delay_after_nav
-        if t.human_like:
-            lo *= t.human_like_multiplier
-            hi *= t.human_like_multiplier
-        delay = random.uniform(lo, hi)
+        # test_mode uses dedicated short delays to keep debug runs fast.
+        if self.config.test_mode:
+            delay = random.uniform(t.test_mode_min_delay, t.test_mode_max_delay)
+        else:
+            lo, hi = t.min_delay_after_nav, t.max_delay_after_nav
+            if t.human_like:
+                lo *= t.human_like_multiplier
+                hi *= t.human_like_multiplier
+            delay = random.uniform(lo, hi)
         logger.debug("Post-nav delay: %.2fs", delay)
         await asyncio.sleep(delay)
 
     async def inter_page_delay(self) -> None:
         """Randomised pause between page requests.  Call from the scraper loop."""
         t = self.config.timing
-        lo, hi = t.min_delay_between_pages, t.max_delay_between_pages
-        if t.human_like:
-            lo *= t.human_like_multiplier
-            hi *= t.human_like_multiplier
-        delay = random.uniform(lo, hi)
+        if self.config.test_mode:
+            delay = random.uniform(t.test_mode_min_delay, t.test_mode_max_delay)
+        else:
+            lo, hi = t.min_delay_between_pages, t.max_delay_between_pages
+            if t.human_like:
+                lo *= t.human_like_multiplier
+                hi *= t.human_like_multiplier
+            delay = random.uniform(lo, hi)
         logger.debug("Inter-page delay: %.2fs", delay)
         await asyncio.sleep(delay)
 

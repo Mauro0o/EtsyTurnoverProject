@@ -1,8 +1,15 @@
 """
 main.py - CLI entry point for the Etsy Turnover Scraper.
 
-Usage:
+Usage (new style, recommended):
+    python main.py --shop-name MyShop --market ie
+
+Usage (legacy, still supported):
     python main.py --shop-name MyShop --domain etsy.ie
+
+Etsy localized URLs embed the country code in the path, not the host:
+    https://www.etsy.com/ie/shop/MyShop/sold
+                         ^^^ market code
 
 Run with --help to see all options and defaults.
 """
@@ -13,6 +20,7 @@ import argparse
 import asyncio
 import logging
 import sys
+import warnings
 from pathlib import Path
 
 from config import (
@@ -24,6 +32,7 @@ from config import (
     TimingConfig,
 )
 from scraper import EtsyTurnoverScraper
+from url_builder import parse_domain_legacy
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,9 +61,27 @@ def parse_args() -> argparse.Namespace:
         help="Etsy seller/shop numeric ID (optional; used for metadata)",
     )
     shop.add_argument(
-        "--domain",
+        "--host",
         default="etsy.com",
-        help="Etsy domain to scrape from (e.g. etsy.com, etsy.ie, etsy.co.uk)",
+        help="Etsy host (default: etsy.com; rarely needs changing)",
+    )
+    shop.add_argument(
+        "--market",
+        default="",
+        help=(
+            "Etsy market/country path prefix, e.g. 'ie', 'uk', 'de'. "
+            "Empty string = US (no prefix). "
+            "Results in URLs like https://www.etsy.com/ie/shop/..."
+        ),
+    )
+    shop.add_argument(
+        "--domain",
+        default=None,
+        help=(
+            "DEPRECATED legacy alias. Pass 'etsy.ie', 'etsy.co.uk', etc. "
+            "and it will be normalised into --host / --market automatically. "
+            "Prefer using --market directly."
+        ),
     )
 
     # ---- Browser ---------------------------------------------------------
@@ -181,11 +208,35 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> AppConfig:
-    """Map parsed CLI args to a fully-typed AppConfig dataclass."""
+    """
+    Map parsed CLI args to a fully-typed AppConfig dataclass.
+
+    Handles the legacy --domain alias by normalising it into host + market.
+    --domain takes lower priority than explicit --host / --market.
+    """
+    host: str = args.host
+    market: str = args.market
+
+    if args.domain is not None:
+        # Legacy --domain supplied.  Normalise and warn.
+        legacy_host, legacy_market = parse_domain_legacy(args.domain)
+        log = __import__("logging").getLogger("main")
+        log.warning(
+            "--domain '%s' is deprecated. Normalised to: host=%s market=%s. "
+            "Use --market %s instead.",
+            args.domain, legacy_host, legacy_market, legacy_market or "(empty=US)",
+        )
+        # Only override if the user did NOT also pass explicit --host / --market.
+        if args.host == "etsy.com":      # still at default
+            host = legacy_host
+        if args.market == "":            # still at default
+            market = legacy_market
+
     return AppConfig(
         shop_id=args.shop_id,
         shop_name=args.shop_name,
-        domain=args.domain,
+        host=host,
+        market=market,
         browser=BrowserConfig(
             headless=args.headless,
             browser_type=args.browser_type,
@@ -233,14 +284,25 @@ def main() -> None:
     log = logging.getLogger("main")
 
     config = build_config(args)
+
+    market_display = config.market or "(us/default)"
     log.info(
-        "Starting Etsy Turnover Scraper — shop: %s | domain: %s | test_mode: %s",
+        "Starting Etsy Turnover Scraper — shop: %s | host: %s | market: %s | test_mode: %s",
         config.shop_name,
-        config.domain,
+        config.host,
+        market_display,
         config.test_mode,
     )
+    # Log effective base URLs so the user can verify routing before scraping starts.
+    from url_builder import build_sold_url, build_storefront_url
+    log.info("Effective sold base URL      : %s", build_sold_url(config.host, config.market, config.shop_name, 1))
+    log.info("Effective storefront base URL: %s", build_storefront_url(config.host, config.market, config.shop_name, 1))
 
     scraper = EtsyTurnoverScraper(config)
+
+    # Suppress ResourceWarning noise from Windows asyncio proactor when
+    # Playwright's subprocess pipes are closed during event-loop teardown.
+    warnings.filterwarnings("ignore", category=ResourceWarning)
 
     try:
         summary = asyncio.run(scraper.run())

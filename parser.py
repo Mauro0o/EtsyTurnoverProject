@@ -25,6 +25,19 @@ Key selectors (verified against live Etsy HTML, Q1 2025):
 
   SOLD STATUS:     <p class="wt-text-title-01"> containing "Sold" text.
                    This element REPLACES the price on sold pages.
+
+PAGINATION selectors (verified against live Etsy HTML, Q1 2025):
+─────────────────────────────────────────────────────────────────────────────
+  PAGINATION NAV:  <nav data-clg-id="WtPagination" aria-label="Pagination of listings">
+  CONTAINER:       <div data-item-pagination="">  (wraps the nav)
+  PAGE LINKS:      <a data-page="N">  inside the nav  (N is the page number)
+  CURRENT PAGE:    <a class="...wt-is-selected" aria-current="true">
+  PREV/NEXT:       <a class="...wt-btn--icon ..."> with screen-reader text
+                   "Previous page" / "Next page"
+
+  Strategy: take the maximum integer value of all [data-page] attributes
+  inside the pagination nav.  This correctly finds the last page even when
+  Etsy collapses the middle pages with "...".
 ─────────────────────────────────────────────────────────────────────────────
 """
 
@@ -77,13 +90,13 @@ def parse_sold_page(
     html: str,
     page_url: str,
     page_number: int,
-    domain: str,
+    host: str,
     shop_name: str,
     shop_id: str,
     snapshot_path: Optional[str] = None,
 ) -> list[SoldListing]:
     """
-    Parse a /shop/{shop_name}/sold page and return SoldListing objects.
+    Parse a sold page and return SoldListing objects.
 
     A card is treated as sold when its price area shows "Sold" text.
     Every card found is returned; partial extraction is preferred over skipping.
@@ -92,7 +105,7 @@ def parse_sold_page(
         html:          Raw HTML string of the sold page.
         page_url:      Canonical URL of the page (stored on each record).
         page_number:   1-based page number (stored on each record).
-        domain:        Etsy domain string, e.g. 'etsy.ie'.
+        host:          Etsy host, e.g. 'etsy.com' (used only for relative-URL fallback).
         shop_name:     Shop slug.
         shop_id:       Shop ID (can be overridden per card from data-shop-id).
         snapshot_path: Path to the saved HTML snapshot (optional, stored verbatim).
@@ -114,7 +127,7 @@ def parse_sold_page(
                 continue
 
             shop_id_on_card = _get_attr(card, CARD_SHOP_ID_ATTR) or shop_id or None
-            listing_url = _extract_listing_url(card, domain)
+            listing_url = _extract_listing_url(card, host)
             title = _extract_title(card, listing_id)
             image_url = _extract_image(card)
             card_text, price_raw, currency = _extract_price_info(card)
@@ -124,7 +137,7 @@ def parse_sold_page(
                 SoldListing(
                     listing_id=listing_id,
                     scrape_timestamp=now_ts,
-                    domain=domain,
+                    domain=host,
                     shop_name=shop_name,
                     shop_id=shop_id_on_card,
                     sold_page_url=page_url,
@@ -152,7 +165,7 @@ def parse_storefront_page(
     html: str,
     page_url: str,
     page_number: int,
-    domain: str,
+    host: str,
     shop_name: str,
     shop_id: str,
     snapshot_path: Optional[str] = None,
@@ -166,7 +179,7 @@ def parse_storefront_page(
         html:          Raw HTML string of the storefront page.
         page_url:      Canonical URL stored on each record.
         page_number:   1-based page number.
-        domain:        Etsy domain string.
+        host:          Etsy host, e.g. 'etsy.com' (used only for relative-URL fallback).
         shop_name:     Shop slug.
         shop_id:       Shop ID (fallback if not on card).
         snapshot_path: Path to saved HTML snapshot (optional).
@@ -188,7 +201,7 @@ def parse_storefront_page(
                 continue
 
             shop_id_on_card = _get_attr(card, CARD_SHOP_ID_ATTR) or shop_id or None
-            listing_url = _extract_listing_url(card, domain)
+            listing_url = _extract_listing_url(card, host)
             title = _extract_title(card, listing_id)
             image_url = _extract_image(card)
             card_text, price_raw, currency = _extract_price_info(card)
@@ -200,7 +213,7 @@ def parse_storefront_page(
                 ActiveListing(
                     listing_id=listing_id,
                     scrape_timestamp=now_ts,
-                    domain=domain,
+                    domain=host,
                     shop_name=shop_name,
                     shop_id=shop_id_on_card,
                     storefront_page_url=page_url,
@@ -223,6 +236,115 @@ def parse_storefront_page(
 
     logger.debug("Storefront page %d: parsed %d listings", page_number, len(results))
     return results
+
+
+# ---------------------------------------------------------------------------
+# Pagination parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_last_page_number(html: str, page_type: str = "sold") -> int:
+    """
+    Inspect the pagination bar and return the last (maximum) page number.
+
+    Returns 1 when no pagination is present (i.e. the page is the only page).
+
+    Strategies (tried in order, stopping at the first hit):
+
+      1. Find <nav data-clg-id="WtPagination"> and read all [data-page] values.
+         This is the most reliable because data-clg-id is stable across layouts.
+         UPDATE: data-clg-id="WtPagination" if Etsy renames this component.
+
+      2. Find <div data-item-pagination=""> and read all [data-page] values.
+         This is the outer container; useful if the nav label changes.
+         UPDATE: data-item-pagination attribute name if Etsy changes it.
+
+      3. Scan the whole document for any [data-page] attributes and take the max.
+         Wide fallback — avoids false positives from non-pagination data-page
+         elements by filtering out values that look unreasonably large (>9999).
+
+      4. Scan all <a href> for ?page=N or &page=N query parameters and take the
+         max.  Works for sold pages that use ?ref=pagination&page=N links.
+         Also covers storefront ?ref=items-pagination&page=N links.
+
+    Args:
+        html:       Full raw HTML of the page to inspect.
+        page_type:  "sold" or "storefront" — used only for debug logging labels.
+
+    Returns:
+        Integer last page number, minimum 1.
+    """
+    soup = BeautifulSoup(html, "lxml")
+
+    def _max_from_data_page(container: Tag) -> int:
+        """Return maximum integer data-page value found within *container*."""
+        max_p = 0
+        for a in container.find_all("a", attrs={"data-page": True}):
+            try:
+                val = int(str(a["data-page"]))
+                if 1 <= val <= 9999:      # sanity-range guard
+                    max_p = max(max_p, val)
+            except (ValueError, TypeError):
+                pass
+        return max_p
+
+    # ---- Strategy 1: WtPagination nav  (preferred) ---------------------
+    # UPDATE selector here if Etsy renames the data-clg-id attribute.
+    nav = soup.find("nav", attrs={"data-clg-id": "WtPagination"})
+    if nav:
+        result = _max_from_data_page(nav)
+        if result > 0:
+            logger.debug(
+                "[%s] parse_last_page: strategy 1 (WtPagination nav) -> %d",
+                page_type, result,
+            )
+            return result
+
+    # ---- Strategy 2: data-item-pagination container --------------------
+    # UPDATE attribute name here if Etsy changes the pagination wrapper.
+    pag_div = soup.find(attrs={"data-item-pagination": True})
+    if pag_div:
+        result = _max_from_data_page(pag_div)
+        if result > 0:
+            logger.debug(
+                "[%s] parse_last_page: strategy 2 (data-item-pagination) -> %d",
+                page_type, result,
+            )
+            return result
+
+    # ---- Strategy 3: global data-page scan ----------------------------
+    result = _max_from_data_page(soup)
+    if result > 0:
+        logger.debug(
+            "[%s] parse_last_page: strategy 3 (global data-page scan) -> %d",
+            page_type, result,
+        )
+        return result
+
+    # ---- Strategy 4: href ?page=N pattern matching --------------------
+    # Sold pages:       ?ref=pagination&page=N
+    # Storefront pages: ?ref=items-pagination&page=N  or ?ref=shop_profile&page=N
+    page_nums: set[int] = set()
+    for a in soup.find_all("a", href=True):
+        href = str(a["href"])
+        m = re.search(r"[?&]page=(\d+)", href)
+        if m:
+            try:
+                val = int(m.group(1))
+                if 1 <= val <= 9999:
+                    page_nums.add(val)
+            except ValueError:
+                pass
+    if page_nums:
+        result = max(page_nums)
+        logger.debug(
+            "[%s] parse_last_page: strategy 4 (href page param) -> %d",
+            page_type, result,
+        )
+        return result
+
+    logger.debug("[%s] parse_last_page: no pagination found, assuming 1 page", page_type)
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -270,23 +392,26 @@ def _get_attr(tag: Tag, attr: str) -> Optional[str]:
     return str(val).strip() if val else None
 
 
-def _extract_listing_url(card: Tag, domain: str) -> Optional[str]:
+def _extract_listing_url(card: Tag, host: str) -> Optional[str]:
     """
     Extract the listing URL from the card.
 
     Primary:  <a data-listing-link href="…">  – strips tracking query params.
     Fallback: First <a href> containing '/listing/'.
+
+    Note: Etsy listing hrefs in card HTML are already absolute, so the host
+    parameter is only used as a fallback for relative-path hrefs (rare).
     """
     # Primary
     link = card.find("a", attrs={LISTING_LINK_ATTR: True})
     if link:
         href = str(link.get("href", ""))
-        # Remove tracking query string; keep only the clean path.
+        # Remove tracking query string; keep only the clean slug path.
         href = href.split("?")[0]
         if href.startswith("//"):
             return "https:" + href
         if href.startswith("/"):
-            return f"https://www.{domain}{href}"
+            return f"https://www.{host}{href}"
         if href.startswith("http"):
             return href
 

@@ -5,6 +5,19 @@ All tuneable parameters live here.  The CLI (main.py) maps args into these
 dataclasses so scraping logic never touches sys.argv directly.
 
 Adjust timing, retry, and output settings here without touching scraping logic.
+
+URL model (as of Q1 2025):
+  Etsy localized pages embed the market/country code in the PATH, not the host.
+  The host is always www.etsy.com.
+
+  Examples:
+    https://www.etsy.com/ie/shop/MyShop/sold   (Ireland)
+    https://www.etsy.com/uk/shop/MyShop/sold   (UK)
+    https://www.etsy.com/shop/MyShop/sold      (US / no market prefix)
+
+  Config fields:
+    host   = "etsy.com"   (always, unless Etsy ever uses a different host)
+    market = "ie"         (path prefix; empty string = US / no prefix)
 """
 
 from __future__ import annotations
@@ -61,14 +74,18 @@ USER_AGENT_POOL: list[str] = [
 class TimingConfig:
     """Pacing/delay settings to keep requests human-like and low-volume."""
 
-    min_delay_after_nav: float = 2.0         # seconds
-    max_delay_after_nav: float = 5.0
-    min_delay_between_pages: float = 3.0
-    max_delay_between_pages: float = 8.0
+    min_delay_after_nav: float = 0.6         # seconds after page load
+    max_delay_after_nav: float = 1.5
+    min_delay_between_pages: float = 0.8
+    max_delay_between_pages: float = 2.0
     # Human-like mode multiplies all delays by human_like_multiplier.
     human_like: bool = False
-    human_like_multiplier: float = 2.5
-    page_load_timeout_ms: int = 30_000       # ms until navigation timeout
+    human_like_multiplier: float = 1.5      # was 2.5; kept gentler
+    page_load_timeout_ms: int = 25_000      # ms until navigation timeout
+
+    # Test-mode overrides (applied automatically when AppConfig.test_mode=True).
+    test_mode_min_delay: float = 0.3
+    test_mode_max_delay: float = 0.7
 
 
 @dataclass
@@ -76,8 +93,8 @@ class RetryConfig:
     """Retry behaviour on navigation failures."""
 
     max_retries: int = 3
-    retry_backoff_base: float = 2.0         # Base seconds; grows exponentially
-    retry_jitter: float = 1.0              # Random ± jitter added per backoff
+    retry_backoff_base: float = 1.5         # Base seconds; grows exponentially
+    retry_jitter: float = 0.4              # Random ± jitter added per backoff
 
 
 @dataclass
@@ -108,7 +125,12 @@ class AppConfig:
 
     shop_id: str = ""
     shop_name: str = ""
-    domain: str = "etsy.com"
+    # --- URL routing ---
+    # host:   always "etsy.com" in practice; exposed for future flexibility.
+    # market: path prefix encoding the Etsy market/country (e.g. "ie", "uk").
+    #         Empty string means no prefix → US default URLs.
+    host: str = "etsy.com"
+    market: str = ""            # e.g. "ie" → /ie/shop/...  |  "" → /shop/...
     browser: BrowserConfig = field(default_factory=BrowserConfig)
     timing: TimingConfig = field(default_factory=TimingConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)

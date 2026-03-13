@@ -11,13 +11,29 @@ cross-matching sold listings with active storefront listings.
 
 ---
 
+## URL model
+
+Etsy embeds the market/country code in the **path**, not the hostname:
+
+```
+https://www.etsy.com/ie/shop/GearShiftAccessories/sold    ← Ireland
+https://www.etsy.com/uk/shop/GearShiftAccessories/sold    ← UK
+https://www.etsy.com/shop/GearShiftAccessories/sold       ← US (no prefix)
+```
+
+Configure this with `--market ie` (new) or `--domain etsy.ie` (legacy alias).
+The host is always `www.etsy.com`.
+
+---
+
 ## What it does
 
-1. Scrapes all sold listings from `/shop/{shop_name}/sold` (paginated).
-2. Scrapes all active listings from `/shop/{shop_name}` (paginated).
-3. Matches sold listings to active listings by exact `listing_id`.
-4. Uses the active listing price as the estimated price for matched rows.
-5. Stores everything in SQLite and exports an Excel workbook.
+1. Scrapes all sold listings from `/{market}/shop/{shop_name}/sold` (paginated).
+2. Scrapes all active listings from `/{market}/shop/{shop_name}` (paginated).
+3. Detects the real last page number from the pagination bar — no blind crawling.
+4. Matches sold listings to active listings by exact `listing_id`.
+5. Uses the active listing price as the estimated price for matched rows.
+6. Stores everything in SQLite and exports an Excel workbook.
 
 ---
 
@@ -54,56 +70,71 @@ Python 3.11+ is recommended.
 ## Quick start
 
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie
+python main.py --shop-name stutututees --market ie
 ```
 
 ---
 
 ## Example commands (one-line format)
 
-**Basic run (visible browser, default settings):**
+**Ireland shop (recommended style):**
+```bash
+python main.py --shop-name stutututees --market ie
+```
+
+**UK shop:**
+```bash
+python main.py --shop-name MyShop --market uk
+```
+
+**US shop (no market prefix):**
+```bash
+python main.py --shop-name MyShop
+```
+
+**Legacy --domain alias (still works, prints a deprecation warning):**
 ```bash
 python main.py --shop-name stutututees --domain etsy.ie
 ```
 
 **Headless mode with a custom output path:**
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie --headless --output-sqlite data/shop.db --output-excel data/shop.xlsx
+python main.py --shop-name stutututees --market ie --headless --output-sqlite data/shop.db --output-excel data/shop.xlsx
 ```
 
-**Test mode (2 pages only, save HTML snapshots):**
+**Test mode (2 pages only, short delays, save HTML snapshots):**
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie --test-mode --save-html --log-level DEBUG
+python main.py --shop-name stutututees --market ie --test-mode --save-html --log-level DEBUG
 ```
 
 **Resume an interrupted run:**
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie --resume
+python main.py --shop-name stutututees --market ie --resume
 ```
 
 **Human-like pacing (longer delays):**
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie --human-like
+python main.py --shop-name stutututees --market ie --human-like
 ```
 
 **Rotate user-agents and export CSV files too:**
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie --rotate-user-agents --csv-export
+python main.py --shop-name stutututees --market ie --rotate-user-agents --csv-export
 ```
 
 **Limit to first 5 pages of each source:**
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie --max-pages-sold 5 --max-pages-storefront 5
+python main.py --shop-name stutututees --market ie --max-pages-sold 5 --max-pages-storefront 5
 ```
 
-**Using etsy.com domain with a shop ID:**
+**US shop with a shop ID:**
 ```bash
-python main.py --shop-name MyShopName --domain etsy.com --shop-id 12345678
+python main.py --shop-name MyShopName --shop-id 12345678
 ```
 
 **Firefox browser engine:**
 ```bash
-python main.py --shop-name stutututees --domain etsy.ie --browser firefox
+python main.py --shop-name stutututees --market ie --browser firefox
 ```
 
 **Persistent browser profile (preserves cookies between runs):**
@@ -119,7 +150,9 @@ python main.py --shop-name stutututees --domain etsy.ie --profile-dir ./browser_
 |---|---|---|
 | `--shop-name` | *(required)* | Etsy shop slug as it appears in URLs |
 | `--shop-id` | `""` | Numeric shop/seller ID (optional metadata) |
-| `--domain` | `etsy.com` | Domain: `etsy.com`, `etsy.ie`, `etsy.co.uk`, etc. |
+| `--market` | `""` | Market/country path prefix: `ie`, `uk`, `de`, etc. Empty = US |
+| `--host` | `etsy.com` | Etsy host (rarely needs changing) |
+| `--domain` | *(legacy)* | Deprecated alias for `--market`. `etsy.ie` → `--market ie` |
 | `--headless` | `False` | Run browser without a visible window |
 | `--browser` | `chromium` | Browser engine: `chromium`, `firefox`, `webkit` |
 | `--rotate-user-agents` | `False` | Randomly pick a UA from a built-in pool |

@@ -37,6 +37,7 @@ Matching logic and limitations:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
@@ -46,7 +47,7 @@ from checkpoint import STAGE_SOLD, STAGE_STOREFRONT, CheckpointManager
 from config import AppConfig
 from exporter import ExcelExporter, SQLiteExporter, export_csv
 from models import ActiveListing, MatchedTurnoverRow, RunSummary, SoldListing
-from parser import parse_sold_page, parse_storefront_page
+from parser import parse_last_page_number, parse_sold_page, parse_storefront_page
 from url_builder import build_sold_url, build_storefront_url
 
 logger = logging.getLogger(__name__)
@@ -74,20 +75,26 @@ class EtsyTurnoverScraper:
         self.db.connect()
         self.checkpoint.connect()
 
+        # A stable string identifier for checkpoint lookups.
+        # Combines host + market so runs for different markets are distinct.
+        domain_key = f"{cfg.host}/{cfg.market}" if cfg.market else cfg.host
+
         # Resolve or create run.
         run_id: Optional[str] = None
         if cfg.resume:
-            run_id = self.checkpoint.find_incomplete_run(cfg.shop_name, cfg.domain)
+            run_id = self.checkpoint.find_incomplete_run(cfg.shop_name, domain_key)
             if run_id:
                 self.checkpoint.run_id = run_id
-                logger.info("Resuming run %s for %s/%s", run_id, cfg.shop_name, cfg.domain)
+                logger.info(
+                    "Resuming run %s for %s (%s)", run_id, cfg.shop_name, domain_key
+                )
             else:
                 logger.info(
-                    "No resumable run found for %s/%s - starting fresh.",
-                    cfg.shop_name, cfg.domain,
+                    "No resumable run found for %s (%s) - starting fresh.",
+                    cfg.shop_name, domain_key,
                 )
         if not run_id:
-            run_id = self.checkpoint.start_run(cfg.shop_name, cfg.shop_id, cfg.domain)
+            run_id = self.checkpoint.start_run(cfg.shop_name, cfg.shop_id, domain_key)
 
         await self.browser.start()
 
@@ -97,12 +104,12 @@ class EtsyTurnoverScraper:
         try:
             # ---- Phase 1: sold listings --------------------------------
             sold_listings = await self._scrape_sold(
-                cfg.shop_name, cfg.shop_id, cfg.domain
+                cfg.shop_name, cfg.shop_id, cfg.host, cfg.market
             )
 
             # ---- Phase 2: active storefront ----------------------------
             active_listings = await self._scrape_storefront(
-                cfg.shop_name, cfg.shop_id, cfg.domain
+                cfg.shop_name, cfg.shop_id, cfg.host, cfg.market
             )
 
             # ---- Phase 3: deduplicate ----------------------------------
@@ -123,7 +130,7 @@ class EtsyTurnoverScraper:
             now_ts = datetime.now(timezone.utc).isoformat()
             matched_rows = _build_matched_turnover(
                 sold_listings, active_listings,
-                cfg.domain, cfg.shop_name, now_ts,
+                domain_key, cfg.shop_name, now_ts,
             )
             self.db.upsert_matched_turnover(matched_rows)
 
@@ -136,7 +143,7 @@ class EtsyTurnoverScraper:
 
             # ---- Phase 8: summary metrics ------------------------------
             summary = _compute_summary(sold_listings, active_listings, matched_rows)
-            _log_summary(summary, cfg.shop_name, cfg.domain)
+            _log_summary(summary, cfg.shop_name, domain_key)
 
             self.checkpoint.finish_run("completed")
             return summary
@@ -148,6 +155,9 @@ class EtsyTurnoverScraper:
 
         finally:
             await self.browser.stop()
+            # Yield to the event loop so Windows proactor can drain any pending
+            # pipe/transport callbacks before asyncio.run() tears down the loop.
+            await asyncio.sleep(0)
             self.db.close()
             self.checkpoint.close()
 
@@ -156,36 +166,51 @@ class EtsyTurnoverScraper:
     # ------------------------------------------------------------------
 
     async def _scrape_sold(
-        self, shop_name: str, shop_id: str, domain: str
+        self, shop_name: str, shop_id: str, host: str, market: str
     ) -> list[SoldListing]:
         """
         Scrape paginated sold pages and return all SoldListing records found.
 
-        In test_mode only 2 pages are scraped.
-        On resume, already-completed pages are skipped.
-        Empty pages stop pagination when stop_on_empty=True (default).
+        Pagination behavior:
+          1. Load page 1 and parse detected_last_page from the pagination bar.
+          2. Clamp the loop upper bound to min(detected_last_page, max_pages_sold).
+          3. In test_mode cap at 2 pages regardless.
+          4. Stop early if a page returns zero listings (unexpected gap).
+          5. On resume, skip already-completed pages.
         """
         cfg = self.config
         pag = cfg.pagination
-        max_pages = 2 if cfg.test_mode else pag.max_pages_sold
         start_page = pag.start_page_sold
 
         # Advance start page past already-completed pages when resuming.
         if cfg.resume and self.checkpoint.run_id:
-            last = self.checkpoint.get_last_completed_page(STAGE_SOLD)
-            if last >= start_page:
-                start_page = last + 1
+            last_done = self.checkpoint.get_last_completed_page(STAGE_SOLD)
+            if last_done >= start_page:
+                start_page = last_done + 1
                 logger.info("[SOLD] Resuming from page %d", start_page)
 
         all_results: list[SoldListing] = []
+        detected_last_page: Optional[int] = None  # discovered after page 1
 
-        for page in range(start_page, start_page + max_pages):
-            # Skip pages already completed in a previous run.
+        page = start_page
+        while True:
+            # ---- Determine loop ceiling --------------------------------
+            if detected_last_page is not None:
+                user_limit = 2 if cfg.test_mode else pag.max_pages_sold
+                crawl_limit = min(detected_last_page, start_page + user_limit - 1)
+            else:
+                crawl_limit = start_page + (1 if cfg.test_mode else pag.max_pages_sold) - 1
+
+            if page > crawl_limit:
+                break
+
+            # Skip already-completed pages on resume.
             if cfg.resume and self.checkpoint.is_page_completed(STAGE_SOLD, page):
                 logger.debug("[SOLD] Skipping completed page %d", page)
+                page += 1
                 continue
 
-            url = build_sold_url(domain, shop_name, page)
+            url = build_sold_url(host, market, shop_name, page)
             self.checkpoint.mark_page_started(STAGE_SOLD, page)
 
             try:
@@ -200,35 +225,61 @@ class EtsyTurnoverScraper:
                     )
                     snapshot_path = str(snap)
 
+                # Detect last page from pagination bar (done once, on page 1,
+                # or whenever not yet detected).
+                if detected_last_page is None:
+                    detected_last_page = parse_last_page_number(html, "sold")
+                    user_limit = 2 if cfg.test_mode else pag.max_pages_sold
+                    crawl_limit = min(
+                        detected_last_page,
+                        start_page + user_limit - 1,
+                    )
+                    logger.info(
+                        "[SOLD] Detected last page: %d | User limit: %d | "
+                        "Will crawl up to page: %d",
+                        detected_last_page, user_limit, crawl_limit,
+                    )
+
                 listings = parse_sold_page(
                     html=html,
                     page_url=url,
                     page_number=page,
-                    domain=domain,
+                    host=host,
                     shop_name=shop_name,
                     shop_id=shop_id,
                     snapshot_path=snapshot_path,
                 )
-                logger.info("[SOLD] Page %d -> %d listings  (%s)", page, len(listings), url)
+                logger.info("[SOLD] Page %d/%d -> %d listings", page, crawl_limit, len(listings))
 
-                if not listings and pag.stop_on_empty:
-                    logger.info("[SOLD] Empty page %d - stopping pagination.", page)
-                    self.checkpoint.mark_page_completed(STAGE_SOLD, page)
-                    break
+                if not listings:
+                    if pag.stop_on_empty:
+                        logger.warning(
+                            "[SOLD] Page %d returned 0 listings (expected ≤%d). "
+                            "Stopping early.",
+                            page, crawl_limit,
+                        )
+                        self.checkpoint.mark_page_completed(STAGE_SOLD, page)
+                        break
+                    # No stop_on_empty: log and continue anyway.
+                    logger.warning("[SOLD] Page %d returned 0 listings.", page)
 
                 all_results.extend(listings)
                 self.checkpoint.mark_page_completed(STAGE_SOLD, page)
 
-                # Incremental persistence after each page.
                 if listings:
                     self.db.upsert_sold_listings(listings)
 
+                if page >= crawl_limit:
+                    logger.info("[SOLD] Reached crawl limit (page %d). Done.", page)
+                    break
+
                 await self.browser.inter_page_delay()
+                page += 1
 
             except Exception as exc:
                 self.checkpoint.mark_page_failed(STAGE_SOLD, page, str(exc))
                 logger.error("[SOLD] Page %d failed: %s - continuing.", page, exc)
-                # Continue to next page rather than aborting the entire run.
+                page += 1
 
         logger.info("[SOLD] Total collected: %d listings", len(all_results))
         return all_results
@@ -238,28 +289,44 @@ class EtsyTurnoverScraper:
     # ------------------------------------------------------------------
 
     async def _scrape_storefront(
-        self, shop_name: str, shop_id: str, domain: str
+        self, shop_name: str, shop_id: str, host: str, market: str
     ) -> list[ActiveListing]:
-        """Scrape paginated storefront pages and return all ActiveListing records."""
+        """
+        Scrape paginated storefront pages and return all ActiveListing records.
+
+        Same pagination-aware loop as _scrape_sold: detect last page from the
+        pagination bar on page 1, clamp to user's max_pages_storefront limit.
+        """
         cfg = self.config
         pag = cfg.pagination
-        max_pages = 2 if cfg.test_mode else pag.max_pages_storefront
         start_page = pag.start_page_storefront
 
         if cfg.resume and self.checkpoint.run_id:
-            last = self.checkpoint.get_last_completed_page(STAGE_STOREFRONT)
-            if last >= start_page:
-                start_page = last + 1
+            last_done = self.checkpoint.get_last_completed_page(STAGE_STOREFRONT)
+            if last_done >= start_page:
+                start_page = last_done + 1
                 logger.info("[STOREFRONT] Resuming from page %d", start_page)
 
         all_results: list[ActiveListing] = []
+        detected_last_page: Optional[int] = None
 
-        for page in range(start_page, start_page + max_pages):
+        page = start_page
+        while True:
+            if detected_last_page is not None:
+                user_limit = 2 if cfg.test_mode else pag.max_pages_storefront
+                crawl_limit = min(detected_last_page, start_page + user_limit - 1)
+            else:
+                crawl_limit = start_page + (1 if cfg.test_mode else pag.max_pages_storefront) - 1
+
+            if page > crawl_limit:
+                break
+
             if cfg.resume and self.checkpoint.is_page_completed(STAGE_STOREFRONT, page):
                 logger.debug("[STOREFRONT] Skipping completed page %d", page)
+                page += 1
                 continue
 
-            url = build_storefront_url(domain, shop_name, page)
+            url = build_storefront_url(host, market, shop_name, page)
             self.checkpoint.mark_page_started(STAGE_STOREFRONT, page)
 
             try:
@@ -274,23 +341,40 @@ class EtsyTurnoverScraper:
                     )
                     snapshot_path = str(snap)
 
+                if detected_last_page is None:
+                    detected_last_page = parse_last_page_number(html, "storefront")
+                    user_limit = 2 if cfg.test_mode else pag.max_pages_storefront
+                    crawl_limit = min(
+                        detected_last_page,
+                        start_page + user_limit - 1,
+                    )
+                    logger.info(
+                        "[STOREFRONT] Detected last page: %d | User limit: %d | "
+                        "Will crawl up to page: %d",
+                        detected_last_page, user_limit, crawl_limit,
+                    )
+
                 listings = parse_storefront_page(
                     html=html,
                     page_url=url,
                     page_number=page,
-                    domain=domain,
+                    host=host,
                     shop_name=shop_name,
                     shop_id=shop_id,
                     snapshot_path=snapshot_path,
                 )
                 logger.info(
-                    "[STOREFRONT] Page %d -> %d listings  (%s)", page, len(listings), url
+                    "[STOREFRONT] Page %d/%d -> %d listings", page, crawl_limit, len(listings)
                 )
 
-                if not listings and pag.stop_on_empty:
-                    logger.info("[STOREFRONT] Empty page %d - stopping pagination.", page)
-                    self.checkpoint.mark_page_completed(STAGE_STOREFRONT, page)
-                    break
+                if not listings:
+                    if pag.stop_on_empty:
+                        logger.warning(
+                            "[STOREFRONT] Page %d returned 0 listings. Stopping early.", page
+                        )
+                        self.checkpoint.mark_page_completed(STAGE_STOREFRONT, page)
+                        break
+                    logger.warning("[STOREFRONT] Page %d returned 0 listings.", page)
 
                 all_results.extend(listings)
                 self.checkpoint.mark_page_completed(STAGE_STOREFRONT, page)
@@ -298,11 +382,17 @@ class EtsyTurnoverScraper:
                 if listings:
                     self.db.upsert_active_listings(listings)
 
+                if page >= crawl_limit:
+                    logger.info("[STOREFRONT] Reached crawl limit (page %d). Done.", page)
+                    break
+
                 await self.browser.inter_page_delay()
+                page += 1
 
             except Exception as exc:
                 self.checkpoint.mark_page_failed(STAGE_STOREFRONT, page, str(exc))
                 logger.error("[STOREFRONT] Page %d failed: %s - continuing.", page, exc)
+                page += 1
 
         logger.info("[STOREFRONT] Total collected: %d listings", len(all_results))
         return all_results
