@@ -32,8 +32,39 @@ The host is always `www.etsy.com`.
 2. Scrapes all active listings from `/{market}/shop/{shop_name}` (paginated).
 3. Detects the real last page number from the pagination bar — no blind crawling.
 4. Matches sold listings to active listings by exact `listing_id`.
-5. Uses the active listing price as the estimated price for matched rows.
-6. Stores everything in SQLite and exports an Excel workbook.
+5. Aggregates repeated sold `listing_id`s — each occurrence = one sale event.
+6. `estimated_turnover = active_price × sales_count` per matched listing.
+7. Stores everything in SQLite and exports an Excel workbook.
+
+---
+
+## Sold listing deduplication modes
+
+By default the scraper treats every row on the sold pages as a **distinct sale event**.
+If the same `listing_id` appears twice, that means the item was sold twice.
+
+| Mode | CLI flag | Behaviour |
+|---|---|---|
+| `preserve_all` | *(default)* | Every scraped row is kept. Repeated IDs → multiple sales. |
+| `unique_listing_id` | `--sold-dedup-mode unique_listing_id` | Collapse to one row per `listing_id` (legacy). |
+
+**Example — preserve_all (default):**
+```
+listing_id 123 appears 3× in sold pages
+active price for 123 = €19.99
+→ matched_turnover: sales_count=3, estimated_turnover=€59.97
+```
+
+**Example — unique_listing_id:**
+```
+listing_id 123 appears 3× in sold pages → collapsed to 1 sold row
+active price for 123 = €19.99
+→ matched_turnover: sales_count=1, estimated_turnover=€19.99
+```
+
+> **Note:** If you have an existing `etsy_turnover.db` from a previous version,
+> delete it before running.  The sold_listings table schema changed (new primary
+> key `sold_row_id`); SQLite cannot migrate it in-place.
 
 ---
 
@@ -142,6 +173,16 @@ python main.py --shop-name stutututees --market ie --browser firefox
 python main.py --shop-name stutututees --domain etsy.ie --profile-dir ./browser_profile
 ```
 
+**Count each repeated sold listing as a separate sale (default — no flag needed):**
+```bash
+python main.py --shop-name stutututees --market ie
+```
+
+**Legacy unique mode — deduplicate sold rows by listing_id:**
+```bash
+python main.py --shop-name stutututees --market ie --sold-dedup-mode unique_listing_id
+```
+
 ---
 
 ## CLI reference
@@ -171,6 +212,7 @@ python main.py --shop-name stutututees --domain etsy.ie --profile-dir ./browser_
 | `--test-mode` | `False` | Scrape only 2 pages per source |
 | `--log-level` | `INFO` | Verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `--max-retries` | `3` | Retries per page before skipping |
+| `--sold-dedup-mode` | `preserve_all` | `preserve_all` = each sold row is a sale; `unique_listing_id` = deduplicate |
 
 ---
 

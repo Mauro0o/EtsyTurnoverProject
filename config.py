@@ -139,3 +139,7 @@ class AppConfig:
     resume: bool = False
     test_mode: bool = False                 # Limits to 2 pages per source
     log_level: str = "INFO"
+    # Sold listing deduplication mode.
+    #   "preserve_all"       (DEFAULT) – every scraped row is a distinct sale event.
+    #   "unique_listing_id"  – collapse to one row per listing_id (legacy mode).
+    sold_dedup_mode: str = "preserve_all"

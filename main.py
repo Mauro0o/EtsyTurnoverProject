@@ -194,6 +194,17 @@ def parse_args() -> argparse.Namespace:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity level",
     )
+    behaviour.add_argument(
+        "--sold-dedup-mode",
+        dest="sold_dedup_mode",
+        default="preserve_all",
+        choices=["preserve_all", "unique_listing_id"],
+        help=(
+            "How to handle repeated sold listing IDs. "
+            "'preserve_all' (default): each occurrence counts as a separate sale. "
+            "'unique_listing_id': collapse to one row per listing ID (legacy mode)."
+        ),
+    )
 
     # ---- Retry ----------------------------------------------------------
     retry = parser.add_argument_group("Retry")
@@ -266,6 +277,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         resume=args.resume,
         test_mode=args.test_mode,
         log_level=args.log_level,
+        sold_dedup_mode=args.sold_dedup_mode,
     )
 
 

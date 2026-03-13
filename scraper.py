@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -113,7 +114,7 @@ class EtsyTurnoverScraper:
             )
 
             # ---- Phase 3: deduplicate ----------------------------------
-            sold_listings = _deduplicate_sold(sold_listings)
+            sold_listings = _deduplicate_sold(sold_listings, cfg.sold_dedup_mode)
             active_listings = _deduplicate_active(active_listings)
             logger.info(
                 "After deduplication - sold: %d unique, active: %d unique",
@@ -249,6 +250,12 @@ class EtsyTurnoverScraper:
                     shop_id=shop_id,
                     snapshot_path=snapshot_path,
                 )
+                # Assign a deterministic sold_row_id so repeated listing_ids on
+                # the same page are stored as distinct rows in the database.
+                for idx, listing in enumerate(listings):
+                    listing.sold_row_id = (
+                        f"{listing.listing_id}|{shop_name}|{host}|p{page}|i{idx}"
+                    )
                 logger.info("[SOLD] Page %d/%d -> %d listings", page, crawl_limit, len(listings))
 
                 if not listings:
@@ -433,6 +440,12 @@ def _build_matched_turnover(
     """
     Cross-match sold listings against active listings by exact listing_id.
 
+    Aggregates repeated sold listing_ids (multiple sales of the same item) into
+    a single MatchedTurnoverRow with sales_count = number of occurrences and
+    estimated_turnover = estimated_price * sales_count.
+
+    One output row per unique sold listing_id.
+
     IMPORTANT - ESTIMATION ONLY:
       The active/current listing price is used as a proxy for the sold price.
       This will be wrong (or unavailable) when:
@@ -442,37 +455,45 @@ def _build_matched_turnover(
 
     matched_flag=1  -> exact match; estimated_price = active price.
     matched_flag=0  -> no match; estimated_price = None.
-
-    To extend with fuzzy title matching, add a second pass here and set
-    match_type = "fuzzy_title".  Do not implement it until exact matching
-    coverage is measured and found insufficient.
     """
-    # Build a quick lookup of active listings by listing_id.
     active_by_id: dict[str, ActiveListing] = {a.listing_id: a for a in active_listings}
+
+    # Count how many times each listing_id appears in sold (handles preserve_all).
+    sold_counts: Counter[str] = Counter(s.listing_id for s in sold_listings)
+
+    # Keep one representative sold entry per listing_id (for title metadata).
+    sold_rep: dict[str, SoldListing] = {}
+    for s in sold_listings:
+        if s.listing_id not in sold_rep:
+            sold_rep[s.listing_id] = s
 
     results: list[MatchedTurnoverRow] = []
 
-    for sold in sold_listings:
-        active = active_by_id.get(sold.listing_id)
+    for listing_id, count in sold_counts.items():
+        sold = sold_rep[listing_id]
+        active = active_by_id.get(listing_id)
 
         if active:
+            turnover = (
+                round(active.price * count, 2) if active.price is not None else None
+            )
             results.append(
                 MatchedTurnoverRow(
                     scrape_timestamp=scrape_timestamp,
                     domain=domain,
                     shop_name=shop_name,
-                    sold_listing_id=sold.listing_id,
+                    sold_listing_id=listing_id,
                     active_listing_id=active.listing_id,
                     match_type="exact_listing_id",
                     sold_title=sold.product_title,
                     active_title=active.product_title,
                     estimated_price=active.price,
                     currency=active.currency,
-                    # For the initial strategy, turnover per unit = price.
-                    estimated_turnover=active.price,
+                    sales_count=count,
+                    estimated_turnover=turnover,
                     matched_flag=1,
                     notes=(
-                        "Estimated from current active listing price. "
+                        f"Estimated from current active listing price × {count} sale(s). "
                         "NOT the actual historical sale price."
                     ),
                 )
@@ -483,23 +504,29 @@ def _build_matched_turnover(
                     scrape_timestamp=scrape_timestamp,
                     domain=domain,
                     shop_name=shop_name,
-                    sold_listing_id=sold.listing_id,
+                    sold_listing_id=listing_id,
                     active_listing_id=None,
                     match_type=None,
                     sold_title=sold.product_title,
                     active_title=None,
                     estimated_price=None,
                     currency=sold.currency,
+                    sales_count=count,
                     estimated_turnover=None,
                     matched_flag=0,
                     notes="No matching active listing found for this sold listing ID.",
                 )
             )
 
-    exact = sum(1 for r in results if r.matched_flag == 1)
+    exact_sales = sum(r.sales_count for r in results if r.matched_flag == 1)
+    total_sales = sum(r.sales_count for r in results)
     logger.info(
-        "Matching complete: %d/%d sold listings matched to an active price.",
-        exact, len(results),
+        "Matching complete: %d/%d sold sales events matched "
+        "(%d unique listing IDs matched out of %d unique).",
+        exact_sales,
+        total_sales,
+        sum(1 for r in results if r.matched_flag == 1),
+        len(results),
     )
     return results
 
@@ -509,16 +536,39 @@ def _build_matched_turnover(
 # ---------------------------------------------------------------------------
 
 
-def _deduplicate_sold(listings: list[SoldListing]) -> list[SoldListing]:
-    """Keep only the first occurrence of each listing_id."""
-    seen: dict[str, SoldListing] = {}
-    for listing in listings:
-        if listing.listing_id not in seen:
-            seen[listing.listing_id] = listing
-    dupes = len(listings) - len(seen)
-    if dupes:
-        logger.debug("Removed %d duplicate sold listings", dupes)
-    return list(seen.values())
+def _deduplicate_sold(listings: list[SoldListing], mode: str) -> list[SoldListing]:
+    """
+    Apply sold deduplication according to *mode*.
+
+    "preserve_all"       (default) – return all rows unchanged; repeated
+                                     listing_ids count as additional sales.
+    "unique_listing_id"            – keep only the first occurrence of each
+                                     listing_id (legacy / reference mode).
+    """
+    if mode == "unique_listing_id":
+        seen: dict[str, SoldListing] = {}
+        for listing in listings:
+            if listing.listing_id not in seen:
+                seen[listing.listing_id] = listing
+        dupes = len(listings) - len(seen)
+        if dupes:
+            logger.info(
+                "unique_listing_id mode: removed %d duplicate sold listing IDs "
+                "(%d unique remain).",
+                dupes, len(seen),
+            )
+        return list(seen.values())
+
+    # preserve_all: keep every row; just log repeat occurrences for visibility.
+    unique_count = len({s.listing_id for s in listings})
+    repeats = len(listings) - unique_count
+    if repeats:
+        logger.info(
+            "preserve_all mode: keeping all %d sold rows "
+            "(%d unique listing IDs, %d repeat occurrences = additional sales).",
+            len(listings), unique_count, repeats,
+        )
+    return listings
 
 
 def _deduplicate_active(listings: list[ActiveListing]) -> list[ActiveListing]:
@@ -543,18 +593,20 @@ def _compute_summary(
     active: list[ActiveListing],
     matched: list[MatchedTurnoverRow],
 ) -> RunSummary:
-    exact = sum(1 for r in matched if r.matched_flag == 1)
+    matched_rows = [r for r in matched if r.matched_flag == 1]
+    exact_sales = sum(r.sales_count for r in matched_rows)   # total matched sale events
+    matched_unique = len(matched_rows)                        # unique listing IDs matched
     turnover_sum = sum(
-        r.estimated_turnover
-        for r in matched
-        if r.matched_flag == 1 and r.estimated_turnover is not None
+        r.estimated_turnover for r in matched_rows if r.estimated_turnover is not None
     )
-    coverage = (exact / len(sold) * 100.0) if sold else 0.0
+    coverage = (exact_sales / len(sold) * 100.0) if sold else 0.0
     return RunSummary(
         total_sold_rows=len(sold),
+        sold_unique_listing_ids=len({s.listing_id for s in sold}),
         total_active_rows=len(active),
-        exact_matches=exact,
-        unmatched_sold_rows=len(sold) - exact,
+        exact_matches=exact_sales,
+        matched_unique_listing_ids=matched_unique,
+        unmatched_sold_rows=len(sold) - exact_sales,
         price_match_coverage_pct=round(coverage, 2),
         estimated_turnover_sum=round(turnover_sum, 2),
     )
@@ -566,10 +618,12 @@ def _log_summary(summary: RunSummary, shop_name: str, domain: str) -> None:
     logger.info("  ETSY TURNOVER ESTIMATION SUMMARY")
     logger.info("  Shop : %s   Domain : %s", shop_name, domain)
     logger.info(sep)
-    logger.info("  Sold listings scraped   : %d", summary.total_sold_rows)
+    logger.info("  Sold rows scraped       : %d  (%d unique listing IDs)",
+                summary.total_sold_rows, summary.sold_unique_listing_ids)
     logger.info("  Active listings scraped : %d", summary.total_active_rows)
-    logger.info("  Exact ID matches        : %d", summary.exact_matches)
-    logger.info("  Unmatched sold rows     : %d", summary.unmatched_sold_rows)
+    logger.info("  Matched sales events    : %d  (%d unique listing IDs matched)",
+                summary.exact_matches, summary.matched_unique_listing_ids)
+    logger.info("  Unmatched sales events  : %d", summary.unmatched_sold_rows)
     logger.info("  Price match coverage    : %.1f%%", summary.price_match_coverage_pct)
     logger.info("  Estimated turnover sum  : %.2f", summary.estimated_turnover_sum)
     logger.info(sep)

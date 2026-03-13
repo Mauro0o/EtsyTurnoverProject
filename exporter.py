@@ -3,8 +3,22 @@ exporter.py - SQLite and Excel export for the Etsy Turnover Scraper.
 
 SQLiteExporter:
   - Creates tables (sold_listings, active_listings, matched_turnover)
-  - Upserts records idempotently (INSERT OR REPLACE keyed on listing_id + shop)
+  - Upserts records idempotently
   - Reads rows back for export
+
+Schema notes (v2 – preserve_all sold dedup mode):
+  sold_listings.sold_row_id  is the PRIMARY KEY (replaces the old composite PK
+      on listing_id+domain+shop_name).  This allows multiple rows for the same
+      listing_id to coexist as distinct sale events.
+      sold_row_id is deterministic: "{listing_id}|{shop_name}|{domain}|p{page}|i{idx}"
+      so re-runs replace (not duplicate) existing rows.
+
+  matched_turnover now has a sales_count column and estimated_turnover reflects
+      price × sales_count.  One row per unique sold listing_id per run.
+
+  IMPORTANT: If you have an existing database created before this version you
+  must DELETE it so the new schema is created from scratch.  SQLite does not
+  support changing a table's primary key in-place.
 
 ExcelExporter:
   - Writes a 3-sheet workbook (sold_listings, active_listings, matched_turnover)
@@ -37,6 +51,7 @@ _NUMERIC_COLS: frozenset[str] = frozenset({
     "price",
     "estimated_price",
     "estimated_turnover",
+    "sales_count",
     "sold_flag",
     "matched_flag",
     "listing_position_on_page",
@@ -83,7 +98,10 @@ class SQLiteExporter:
         assert self._conn is not None
         self._conn.executescript(
             """
+            -- sold_listings: sold_row_id is the PK so repeated listing_ids
+            -- (= multiple sales of the same item) coexist as distinct rows.
             CREATE TABLE IF NOT EXISTS sold_listings (
+                sold_row_id             TEXT NOT NULL PRIMARY KEY,
                 listing_id              TEXT NOT NULL,
                 scrape_timestamp        TEXT,
                 domain                  TEXT,
@@ -99,8 +117,7 @@ class SQLiteExporter:
                 sold_price_raw          TEXT,
                 currency                TEXT,
                 extraction_notes        TEXT,
-                raw_html_snapshot_path  TEXT,
-                PRIMARY KEY (listing_id, domain, shop_name)
+                raw_html_snapshot_path  TEXT
             );
 
             CREATE TABLE IF NOT EXISTS active_listings (
@@ -124,6 +141,9 @@ class SQLiteExporter:
                 PRIMARY KEY (listing_id, domain, shop_name)
             );
 
+            -- matched_turnover: one row per unique sold listing_id per run.
+            -- sales_count = number of times that listing_id appeared in sold rows.
+            -- estimated_turnover = estimated_price * sales_count.
             CREATE TABLE IF NOT EXISTS matched_turnover (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 scrape_timestamp    TEXT,
@@ -136,6 +156,7 @@ class SQLiteExporter:
                 active_title        TEXT,
                 estimated_price     REAL,
                 currency            TEXT,
+                sales_count         INTEGER DEFAULT 1,
                 estimated_turnover  REAL,
                 matched_flag        INTEGER DEFAULT 0,
                 notes               TEXT,
@@ -151,7 +172,10 @@ class SQLiteExporter:
 
     def upsert_sold_listings(self, listings: Sequence[SoldListing]) -> int:
         """
-        Insert or replace sold listings.  Idempotent on (listing_id, domain, shop_name).
+        Insert or replace sold listings, keyed on sold_row_id.
+
+        Because sold_row_id is deterministic, re-running the scraper replaces
+        existing rows rather than duplicating them.
 
         Returns the number of rows processed.
         """
@@ -162,7 +186,7 @@ class SQLiteExporter:
         self._conn.executemany(
             """
             INSERT OR REPLACE INTO sold_listings VALUES
-            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             rows,
         )
@@ -203,8 +227,8 @@ class SQLiteExporter:
             INSERT OR REPLACE INTO matched_turnover
             (scrape_timestamp, domain, shop_name, sold_listing_id, active_listing_id,
              match_type, sold_title, active_title, estimated_price, currency,
-             estimated_turnover, matched_flag, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             sales_count, estimated_turnover, matched_flag, notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             data,
         )
@@ -350,6 +374,7 @@ def export_csv(rows: list[dict], path: Path) -> None:
 
 def _sold_to_row(s: SoldListing) -> tuple:
     return (
+        s.sold_row_id,
         s.listing_id,
         s.scrape_timestamp,
         s.domain,
@@ -403,6 +428,7 @@ def _matched_to_row(m: MatchedTurnoverRow) -> tuple:
         m.active_title,
         m.estimated_price,
         m.currency,
+        m.sales_count,
         m.estimated_turnover,
         m.matched_flag,
         m.notes,
