@@ -143,3 +143,7 @@ class AppConfig:
     #   "preserve_all"       (DEFAULT) – every scraped row is a distinct sale event.
     #   "unique_listing_id"  – collapse to one row per listing_id (legacy mode).
     sold_dedup_mode: str = "preserve_all"
+    # Optional keyword filter for storefront crawls.
+    # Each keyword triggers a separate paginated storefront crawl with
+    # search_query=<keyword> in the URL.  Empty list = no filter (full store).
+    storefront_keywords: list[str] = field(default_factory=list)

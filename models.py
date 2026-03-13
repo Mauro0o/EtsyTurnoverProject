@@ -86,6 +86,7 @@ class ActiveListing:
     listing_position_on_page: int = 0
     extraction_notes: Optional[str] = None
     raw_html_snapshot_path: Optional[str] = None
+    storefront_keyword: str = ""  # "" = no keyword filter; otherwise the keyword used
 
 
 @dataclass
@@ -112,6 +113,8 @@ class MatchedTurnoverRow:
     match_type: Optional[str] = None           # "exact_listing_id" or None
     sold_title: Optional[str] = None
     active_title: Optional[str] = None
+    sold_listing_url: Optional[str] = None    # URL of the sold listing for visual verification
+    active_listing_url: Optional[str] = None  # URL of the matched active listing
     estimated_price: Optional[float] = None
     currency: Optional[str] = None
     sales_count: int = 1                       # total sale events for this listing_id

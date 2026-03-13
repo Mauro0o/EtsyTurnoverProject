@@ -29,12 +29,14 @@ The host is always `www.etsy.com`.
 ## What it does
 
 1. Scrapes all sold listings from `/{market}/shop/{shop_name}/sold` (paginated).
-2. Scrapes all active listings from `/{market}/shop/{shop_name}` (paginated).
+2. Scrapes all active listings from `/{market}/shop/{shop_name}` (paginated), optionally filtered by one or more keywords.
 3. Detects the real last page number from the pagination bar — no blind crawling.
 4. Matches sold listings to active listings by exact `listing_id`.
 5. Aggregates repeated sold `listing_id`s — each occurrence = one sale event.
 6. `estimated_turnover = active_price × sales_count` per matched listing.
-7. Stores everything in SQLite and exports an Excel workbook.
+7. Records which keyword found each active listing (`storefront_keyword` column).
+8. Includes both `sold_listing_url` and `active_listing_url` in matched_turnover for visual verification.
+9. Stores everything in SQLite and exports an Excel workbook.
 
 ---
 
@@ -63,8 +65,52 @@ active price for 123 = €19.99
 ```
 
 > **Note:** If you have an existing `etsy_turnover.db` from a previous version,
-> delete it before running.  The sold_listings table schema changed (new primary
-> key `sold_row_id`); SQLite cannot migrate it in-place.
+> delete it before running.  The `active_listings` PK changed to include
+> `storefront_keyword`, and `matched_turnover` has two new URL columns.
+> SQLite cannot migrate schemas in-place.
+
+---
+
+## Storefront keyword filter
+
+Use `--storefront-keywords` to focus the storefront crawl on a specific subset of products.
+
+- **Applies only to storefront pages** — sold pages are always scraped without a filter.
+- Each keyword triggers its own separate paginated crawl.
+- Pagination is detected from the filtered result set for each keyword.
+- The keyword used to find each listing is stored in `active_listings.storefront_keyword`.
+- If the same `listing_id` is found under two different keywords, both rows are kept in `active_listings`.
+- For `matched_turnover`, a single canonical active row per `listing_id` is chosen (first encountered).
+
+**URL structure with keyword:**
+```
+page 1:  https://www.etsy.com/ie/shop/{shop}/search_query=toyota#items
+page 2:  https://www.etsy.com/ie/shop/{shop}?ref=condensed_trust_header_title_sold&search_query=toyota&page=2#items
+```
+
+**Single keyword:**
+```bash
+python main.py --shop-name GearShiftAccessories --market ie --storefront-keywords toyota
+```
+
+**Multiple keywords (separate crawl per keyword):**
+```bash
+python main.py --shop-name GearShiftAccessories --market ie --storefront-keywords toyota "gazoo racing" keyring
+```
+
+**No keyword — full storefront crawl (default):**
+```bash
+python main.py --shop-name GearShiftAccessories --market ie
+```
+
+---
+
+## Matched turnover URL columns
+
+`matched_turnover` now includes `sold_listing_url` and `active_listing_url` so you can open both sides of the match directly from Excel to verify they are the same product.
+
+- `sold_listing_url` — URL of the sold listing (populated for all matched and unmatched rows when available).
+- `active_listing_url` — URL of the matched active listing (NULL for unmatched rows).
 
 ---
 
@@ -183,6 +229,16 @@ python main.py --shop-name stutututees --market ie
 python main.py --shop-name stutututees --market ie --sold-dedup-mode unique_listing_id
 ```
 
+**Storefront keyword filter — single keyword:**
+```bash
+python main.py --shop-name GearShiftAccessories --market ie --storefront-keywords toyota
+```
+
+**Storefront keyword filter — multiple keywords:**
+```bash
+python main.py --shop-name GearShiftAccessories --market ie --storefront-keywords toyota "gazoo racing" keyring
+```
+
 ---
 
 ## CLI reference
@@ -213,6 +269,7 @@ python main.py --shop-name stutututees --market ie --sold-dedup-mode unique_list
 | `--log-level` | `INFO` | Verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `--max-retries` | `3` | Retries per page before skipping |
 | `--sold-dedup-mode` | `preserve_all` | `preserve_all` = each sold row is a sale; `unique_listing_id` = deduplicate |
+| `--storefront-keywords` | *(none)* | One or more keywords to filter storefront pages. Each triggers a separate crawl. Omit for full store. |
 
 ---
 

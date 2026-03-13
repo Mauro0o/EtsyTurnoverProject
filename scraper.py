@@ -109,9 +109,22 @@ class EtsyTurnoverScraper:
             )
 
             # ---- Phase 2: active storefront ----------------------------
-            active_listings = await self._scrape_storefront(
-                cfg.shop_name, cfg.shop_id, cfg.host, cfg.market
-            )
+            keywords = cfg.storefront_keywords
+            if keywords:
+                for kw in keywords:
+                    logger.info("[STOREFRONT] Keyword filter active: %s", kw)
+                    kw_listings = await self._scrape_storefront(
+                        cfg.shop_name, cfg.shop_id, cfg.host, cfg.market, search_query=kw
+                    )
+                    active_listings.extend(kw_listings)
+                logger.info(
+                    "[STOREFRONT] Total active listings across %d keyword(s): %d",
+                    len(keywords), len(active_listings),
+                )
+            else:
+                active_listings = await self._scrape_storefront(
+                    cfg.shop_name, cfg.shop_id, cfg.host, cfg.market
+                )
 
             # ---- Phase 3: deduplicate ----------------------------------
             sold_listings = _deduplicate_sold(sold_listings, cfg.sold_dedup_mode)
@@ -296,23 +309,32 @@ class EtsyTurnoverScraper:
     # ------------------------------------------------------------------
 
     async def _scrape_storefront(
-        self, shop_name: str, shop_id: str, host: str, market: str
+        self,
+        shop_name: str,
+        shop_id: str,
+        host: str,
+        market: str,
+        search_query: Optional[str] = None,
     ) -> list[ActiveListing]:
         """
         Scrape paginated storefront pages and return all ActiveListing records.
 
         Same pagination-aware loop as _scrape_sold: detect last page from the
         pagination bar on page 1, clamp to user's max_pages_storefront limit.
+
+        If search_query is provided, all URLs include search_query=<keyword>.
+        Pagination detection works on the filtered result set, not the full store.
         """
         cfg = self.config
         pag = cfg.pagination
         start_page = pag.start_page_storefront
+        kw_label = f"keyword='{search_query}'" if search_query else "no keyword filter"
 
         if cfg.resume and self.checkpoint.run_id:
             last_done = self.checkpoint.get_last_completed_page(STAGE_STOREFRONT)
             if last_done >= start_page:
                 start_page = last_done + 1
-                logger.info("[STOREFRONT] Resuming from page %d", start_page)
+                logger.info("[STOREFRONT] Resuming from page %d (%s)", start_page, kw_label)
 
         all_results: list[ActiveListing] = []
         detected_last_page: Optional[int] = None
@@ -333,7 +355,7 @@ class EtsyTurnoverScraper:
                 page += 1
                 continue
 
-            url = build_storefront_url(host, market, shop_name, page)
+            url = build_storefront_url(host, market, shop_name, page, search_query=search_query)
             self.checkpoint.mark_page_started(STAGE_STOREFRONT, page)
 
             try:
@@ -341,10 +363,11 @@ class EtsyTurnoverScraper:
                 snapshot_path: Optional[str] = None
 
                 if cfg.output.save_html:
+                    kw_suffix = f"_{search_query.replace(' ', '_')}" if search_query else ""
                     snap = await self.browser.save_html_snapshot(
                         html,
                         cfg.output.html_snapshot_dir,
-                        f"storefront_{shop_name}_p{page:04d}.html",
+                        f"storefront_{shop_name}{kw_suffix}_p{page:04d}.html",
                     )
                     snapshot_path = str(snap)
 
@@ -356,9 +379,9 @@ class EtsyTurnoverScraper:
                         start_page + user_limit - 1,
                     )
                     logger.info(
-                        "[STOREFRONT] Detected last page: %d | User limit: %d | "
+                        "[STOREFRONT] Detected last page (%s): %d | User limit: %d | "
                         "Will crawl up to page: %d",
-                        detected_last_page, user_limit, crawl_limit,
+                        kw_label, detected_last_page, user_limit, crawl_limit,
                     )
 
                 listings = parse_storefront_page(
@@ -370,8 +393,12 @@ class EtsyTurnoverScraper:
                     shop_id=shop_id,
                     snapshot_path=snapshot_path,
                 )
+                # Tag each listing with the keyword used (empty string = no filter).
+                for listing in listings:
+                    listing.storefront_keyword = search_query or ""
                 logger.info(
-                    "[STOREFRONT] Page %d/%d -> %d listings", page, crawl_limit, len(listings)
+                    "[STOREFRONT] Page %d/%d (%s) -> %d listings",
+                    page, crawl_limit, kw_label, len(listings),
                 )
 
                 if not listings:
@@ -456,7 +483,12 @@ def _build_matched_turnover(
     matched_flag=1  -> exact match; estimated_price = active price.
     matched_flag=0  -> no match; estimated_price = None.
     """
-    active_by_id: dict[str, ActiveListing] = {a.listing_id: a for a in active_listings}
+    # First-wins: when the same listing_id appears under multiple keywords,
+    # use the first encountered active row as the canonical match.
+    active_by_id: dict[str, ActiveListing] = {}
+    for a in active_listings:
+        if a.listing_id not in active_by_id:
+            active_by_id[a.listing_id] = a
 
     # Count how many times each listing_id appears in sold (handles preserve_all).
     sold_counts: Counter[str] = Counter(s.listing_id for s in sold_listings)
@@ -487,6 +519,8 @@ def _build_matched_turnover(
                     match_type="exact_listing_id",
                     sold_title=sold.product_title,
                     active_title=active.product_title,
+                    sold_listing_url=sold.listing_url,
+                    active_listing_url=active.listing_url,
                     estimated_price=active.price,
                     currency=active.currency,
                     sales_count=count,
@@ -509,6 +543,8 @@ def _build_matched_turnover(
                     match_type=None,
                     sold_title=sold.product_title,
                     active_title=None,
+                    sold_listing_url=sold.listing_url,
+                    active_listing_url=None,
                     estimated_price=None,
                     currency=sold.currency,
                     sales_count=count,
@@ -572,15 +608,28 @@ def _deduplicate_sold(listings: list[SoldListing], mode: str) -> list[SoldListin
 
 
 def _deduplicate_active(listings: list[ActiveListing]) -> list[ActiveListing]:
-    """Keep only the first occurrence of each listing_id."""
-    seen: dict[str, ActiveListing] = {}
+    """
+    Keep only the first occurrence of each (listing_id, storefront_keyword) pair.
+
+    When keyword filters are used, the same listing_id may appear under multiple
+    keywords — those are kept as separate rows so the keyword association is
+    preserved.  Duplicates *within* the same keyword crawl are removed.
+    """
+    seen: set[tuple[str, str]] = set()
+    result: list[ActiveListing] = []
     for listing in listings:
-        if listing.listing_id not in seen:
-            seen[listing.listing_id] = listing
-    dupes = len(listings) - len(seen)
+        key = (listing.listing_id, listing.storefront_keyword)
+        if key not in seen:
+            seen.add(key)
+            result.append(listing)
+    dupes = len(listings) - len(result)
     if dupes:
-        logger.debug("Removed %d duplicate active listings", dupes)
-    return list(seen.values())
+        logger.info(
+            "Active dedup: removed %d duplicate (listing_id, keyword) rows "
+            "(%d unique remain).",
+            dupes, len(result),
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------

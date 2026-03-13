@@ -205,6 +205,19 @@ def parse_args() -> argparse.Namespace:
             "'unique_listing_id': collapse to one row per listing ID (legacy mode)."
         ),
     )
+    behaviour.add_argument(
+        "--storefront-keywords",
+        dest="storefront_keywords",
+        nargs="*",
+        default=None,
+        metavar="KEYWORD",
+        help=(
+            "Optional keyword(s) to filter the storefront crawl. "
+            "Each keyword runs a separate paginated crawl with search_query=<keyword>. "
+            "Example: --storefront-keywords toyota 'gazoo racing' keyring. "
+            "Omit to crawl the full unfiltered storefront."
+        ),
+    )
 
     # ---- Retry ----------------------------------------------------------
     retry = parser.add_argument_group("Retry")
@@ -278,6 +291,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         test_mode=args.test_mode,
         log_level=args.log_level,
         sold_dedup_mode=args.sold_dedup_mode,
+        storefront_keywords=args.storefront_keywords or [],
     )
 
 
@@ -309,6 +323,10 @@ def main() -> None:
     from url_builder import build_sold_url, build_storefront_url
     log.info("Effective sold base URL      : %s", build_sold_url(config.host, config.market, config.shop_name, 1))
     log.info("Effective storefront base URL: %s", build_storefront_url(config.host, config.market, config.shop_name, 1))
+    if config.storefront_keywords:
+        log.info("Storefront keyword filter(s) : %s", config.storefront_keywords)
+    else:
+        log.info("Storefront keyword filter(s) : (none — full storefront crawl)")
 
     scraper = EtsyTurnoverScraper(config)
 

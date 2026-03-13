@@ -16,6 +16,14 @@ Schema notes (v2 – preserve_all sold dedup mode):
   matched_turnover now has a sales_count column and estimated_turnover reflects
       price × sales_count.  One row per unique sold listing_id per run.
 
+  active_listings.storefront_keyword  records which keyword filter was used to
+      find the listing.  "" = no filter (full storefront crawl).  The PK is
+      (listing_id, domain, shop_name, storefront_keyword) so the same listing
+      found under different keywords produces distinct rows.
+
+  matched_turnover.sold_listing_url / active_listing_url  let you visually verify
+      in Excel that the matched rows correspond to the same product.
+
   IMPORTANT: If you have an existing database created before this version you
   must DELETE it so the new schema is created from scratch.  SQLite does not
   support changing a table's primary key in-place.
@@ -138,7 +146,8 @@ class SQLiteExporter:
                 listing_position_on_page INTEGER,
                 extraction_notes         TEXT,
                 raw_html_snapshot_path   TEXT,
-                PRIMARY KEY (listing_id, domain, shop_name)
+                storefront_keyword       TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (listing_id, domain, shop_name, storefront_keyword)
             );
 
             -- matched_turnover: one row per unique sold listing_id per run.
@@ -154,6 +163,8 @@ class SQLiteExporter:
                 match_type          TEXT,
                 sold_title          TEXT,
                 active_title        TEXT,
+                sold_listing_url    TEXT,
+                active_listing_url  TEXT,
                 estimated_price     REAL,
                 currency            TEXT,
                 sales_count         INTEGER DEFAULT 1,
@@ -205,7 +216,7 @@ class SQLiteExporter:
         self._conn.executemany(
             """
             INSERT OR REPLACE INTO active_listings VALUES
-            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             rows,
         )
@@ -226,9 +237,9 @@ class SQLiteExporter:
             """
             INSERT OR REPLACE INTO matched_turnover
             (scrape_timestamp, domain, shop_name, sold_listing_id, active_listing_id,
-             match_type, sold_title, active_title, estimated_price, currency,
-             sales_count, estimated_turnover, matched_flag, notes)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+             match_type, sold_title, active_title, sold_listing_url, active_listing_url,
+             estimated_price, currency, sales_count, estimated_turnover, matched_flag, notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             data,
         )
@@ -413,6 +424,7 @@ def _active_to_row(a: ActiveListing) -> tuple:
         a.listing_position_on_page,
         a.extraction_notes,
         a.raw_html_snapshot_path,
+        a.storefront_keyword,  # "" for unfiltered crawls
     )
 
 
@@ -426,6 +438,8 @@ def _matched_to_row(m: MatchedTurnoverRow) -> tuple:
         m.match_type,
         m.sold_title,
         m.active_title,
+        m.sold_listing_url,
+        m.active_listing_url,
         m.estimated_price,
         m.currency,
         m.sales_count,

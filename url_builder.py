@@ -27,6 +27,8 @@ Backward compatibility:
 from __future__ import annotations
 
 import re
+from typing import Optional
+from urllib.parse import quote_plus
 
 
 # ---------------------------------------------------------------------------
@@ -140,27 +142,49 @@ def build_sold_url(host: str, market: str, shop_name: str, page: int = 1) -> str
     return f"{base}?ref=pagination&page={page}"
 
 
-def build_storefront_url(host: str, market: str, shop_name: str, page: int = 1) -> str:
+def build_storefront_url(
+    host: str,
+    market: str,
+    shop_name: str,
+    page: int = 1,
+    search_query: Optional[str] = None,
+) -> str:
     """
     Build a storefront (active listings) page URL.
 
     Args:
-        host:      Etsy host.
-        market:    Market/country code.
-        shop_name: Shop slug.
-        page:      1-based page number.
+        host:         Etsy host.
+        market:       Market/country code.
+        shop_name:    Shop slug.
+        page:         1-based page number.
+        search_query: Optional keyword filter — appended as search_query=... in
+                      the query string.  None/empty = no keyword filter.
 
     Returns:
         Fully-qualified URL string.
 
-    Examples:
+    Examples (no keyword):
         build_storefront_url("etsy.com", "ie", "GearShiftAccessories", 1)
           -> "https://www.etsy.com/ie/shop/GearShiftAccessories"
         build_storefront_url("etsy.com", "ie", "GearShiftAccessories", 2)
           -> "https://www.etsy.com/ie/shop/GearShiftAccessories?ref=shop_profile&page=2#items"
+
+    Examples (with keyword):
+        build_storefront_url("etsy.com", "ie", "GearShiftAccessories", 1, "toyota")
+          -> "https://www.etsy.com/ie/shop/GearShiftAccessories?ref=condensed_trust_header_title_sold&search_query=toyota#items"
+        build_storefront_url("etsy.com", "ie", "GearShiftAccessories", 2, "gazoo racing")
+          -> "https://www.etsy.com/ie/shop/GearShiftAccessories?ref=condensed_trust_header_title_sold&search_query=gazoo+racing&page=2#items"
     """
     prefix = build_market_prefix(market)
     base = f"https://www.{host}{prefix}/shop/{shop_name}"
+
+    if search_query:
+        encoded_q = quote_plus(search_query)
+        if page <= 1:
+            return f"{base}?ref=condensed_trust_header_title_sold&search_query={encoded_q}#items"
+        return f"{base}?ref=condensed_trust_header_title_sold&search_query={encoded_q}&page={page}#items"
+
+    # No keyword – original behaviour.
     if page <= 1:
         return base
     return f"{base}?ref=shop_profile&page={page}#items"
